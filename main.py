@@ -1,5 +1,8 @@
+import calendar
 import re
 import time
+import unicodedata
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import quote_plus
@@ -13,6 +16,7 @@ MAX_REVIEWS = 5
 OUTPUT_FOLDER = "./output"
 HEADLESS = False
 WAIT_TIMEOUT = 30000
+BROWSER_CHANNEL = "msedge"
 
 MAPS_LANGUAGE_CODE = "pt-BR"
 GOOGLE_MAPS_URL = f"https://www.google.com/maps?hl={MAPS_LANGUAGE_CODE}"
@@ -23,10 +27,92 @@ POST_ACTION_WAIT_MS = 1500
 SCROLL_WAIT_MS = 2000
 MAX_IDLE_SCROLLS = 10
 DATE_NOT_INFORMED = "Não informado"
+DATE_OUTPUT_FORMAT = "%d/%m/%y"
 SEARCH_LOAD_WAIT_MS = 10000
 POLL_INTERVAL_MS = 300
 MAX_REVIEW_BUTTON_CANDIDATES = 5
 REVIEWS_READY_WAIT_MULTIPLIER = 4
+
+TODAY_KEYWORDS = ("hoje", "today", "just now", "agora")
+YESTERDAY_KEYWORDS = ("ontem", "yesterday")
+SINGULAR_QUANTITY_WORDS = ("um", "uma", "a", "an", "one")
+
+TIME_UNIT_ALIASES = {
+    "min": "minute",
+    "mins": "minute",
+    "minute": "minute",
+    "minutes": "minute",
+    "minuto": "minute",
+    "minutos": "minute",
+    "h": "hour",
+    "hr": "hour",
+    "hrs": "hour",
+    "hour": "hour",
+    "hours": "hour",
+    "hora": "hour",
+    "horas": "hour",
+    "day": "day",
+    "days": "day",
+    "dia": "day",
+    "dias": "day",
+    "week": "week",
+    "weeks": "week",
+    "semana": "week",
+    "semanas": "week",
+    "month": "month",
+    "months": "month",
+    "mes": "month",
+    "meses": "month",
+    "year": "year",
+    "years": "year",
+    "ano": "year",
+    "anos": "year",
+}
+
+MONTH_NAME_ALIASES = {
+    "jan": 1,
+    "janeiro": 1,
+    "january": 1,
+    "fev": 2,
+    "fevereiro": 2,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "marco": 3,
+    "march": 3,
+    "abr": 4,
+    "abril": 4,
+    "apr": 4,
+    "april": 4,
+    "mai": 5,
+    "maio": 5,
+    "may": 5,
+    "jun": 6,
+    "junho": 6,
+    "june": 6,
+    "jul": 7,
+    "julho": 7,
+    "july": 7,
+    "ago": 8,
+    "agosto": 8,
+    "aug": 8,
+    "august": 8,
+    "set": 9,
+    "setembro": 9,
+    "sep": 9,
+    "september": 9,
+    "out": 10,
+    "outubro": 10,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "novembro": 11,
+    "november": 11,
+    "dez": 12,
+    "dezembro": 12,
+    "dec": 12,
+    "december": 12,
+}
 
 SEARCH_BOX_SELECTORS = (
     "input#searchboxinput",
@@ -98,6 +184,130 @@ def parse_stars_from_label(label: str) -> int:
     if not match:
         return 0
     return int(match.group(1))
+
+
+def strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value)
+    return "".join(character for character in normalized if unicodedata.category(character) != "Mn")
+
+
+def format_review_date(value: date) -> str:
+    return value.strftime(DATE_OUTPUT_FORMAT)
+
+
+def subtract_months(reference_date: date, months: int) -> date:
+    total_months = reference_date.year * 12 + (reference_date.month - 1) - months
+    target_year = total_months // 12
+    target_month = (total_months % 12) + 1
+    max_day = calendar.monthrange(target_year, target_month)[1]
+    target_day = min(reference_date.day, max_day)
+    return date(target_year, target_month, target_day)
+
+
+def subtract_years(reference_date: date, years: int) -> date:
+    target_year = reference_date.year - years
+    max_day = calendar.monthrange(target_year, reference_date.month)[1]
+    target_day = min(reference_date.day, max_day)
+    return date(target_year, reference_date.month, target_day)
+
+
+def parse_absolute_review_date(text_ascii: str) -> Optional[date]:
+    normalized = re.sub(r"[.,]", "", text_ascii)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    numeric_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", normalized)
+    if numeric_match:
+        day, month, year = numeric_match.groups()
+        year_int = int(year)
+        if year_int < 100:
+            year_int += 2000
+        try:
+            return date(year_int, int(month), int(day))
+        except ValueError:
+            return None
+
+    month_first_match = re.search(r"\b([a-z]+)\s+(\d{1,2})(?:\s+|,\s*)(\d{4})\b", normalized)
+    if month_first_match:
+        month_name, day, year = month_first_match.groups()
+        month_number = MONTH_NAME_ALIASES.get(month_name)
+        if month_number:
+            try:
+                return date(int(year), month_number, int(day))
+            except ValueError:
+                return None
+
+    day_first_match = re.search(r"\b(\d{1,2})\s+(?:de\s+)?([a-z]+)\s+(?:de\s+)?(\d{4})\b", normalized)
+    if day_first_match:
+        day, month_name, year = day_first_match.groups()
+        month_number = MONTH_NAME_ALIASES.get(month_name)
+        if month_number:
+            try:
+                return date(int(year), month_number, int(day))
+            except ValueError:
+                return None
+
+    return None
+
+
+def parse_relative_review_date(text_ascii: str, reference_date: date) -> Optional[date]:
+    normalized = re.sub(r"\s+", " ", text_ascii).strip()
+    if not normalized:
+        return None
+
+    if any(keyword in normalized for keyword in TODAY_KEYWORDS):
+        return reference_date
+
+    if any(keyword in normalized for keyword in YESTERDAY_KEYWORDS):
+        return reference_date - timedelta(days=1)
+
+    relative_match = re.search(r"(ha\s+)?(\d+|um|uma|a|an|one)\s+([a-z]+)", normalized)
+    if not relative_match:
+        return None
+
+    quantity_token = relative_match.group(2)
+    unit_token = relative_match.group(3)
+
+    if quantity_token.isdigit():
+        quantity = int(quantity_token)
+    elif quantity_token in SINGULAR_QUANTITY_WORDS:
+        quantity = 1
+    else:
+        return None
+
+    unit = TIME_UNIT_ALIASES.get(unit_token)
+    if not unit:
+        return None
+
+    if unit == "minute" or unit == "hour":
+        return reference_date
+    if unit == "day":
+        return reference_date - timedelta(days=quantity)
+    if unit == "week":
+        return reference_date - timedelta(weeks=quantity)
+    if unit == "month":
+        return subtract_months(reference_date, quantity)
+    if unit == "year":
+        return subtract_years(reference_date, quantity)
+    return None
+
+
+def normalize_review_date(raw_review_date: str, reference_date: Optional[date] = None) -> str:
+    review_date = normalize_text(raw_review_date)
+    if not review_date:
+        return DATE_NOT_INFORMED
+
+    base_date = reference_date or date.today()
+    text_ascii = strip_accents(review_date.lower())
+
+    parsed_relative_date = parse_relative_review_date(text_ascii, base_date)
+    if parsed_relative_date:
+        return format_review_date(parsed_relative_date)
+
+    parsed_absolute_date = parse_absolute_review_date(text_ascii)
+    if parsed_absolute_date:
+        return format_review_date(parsed_absolute_date)
+
+    return DATE_NOT_INFORMED
 
 
 def run_with_retry(step_name: str, action: Callable[[], None]) -> None:
@@ -356,7 +566,8 @@ def extract_review(review_card: Locator) -> Optional[dict]:
     if not normalize_text(review_text):
         return None
 
-    review_date = get_text_from_selectors(review_card, REVIEW_DATE_SELECTORS) or DATE_NOT_INFORMED
+    raw_review_date = get_text_from_selectors(review_card, REVIEW_DATE_SELECTORS)
+    review_date = normalize_review_date(raw_review_date)
 
     return {
         "estrelas": stars,
@@ -446,7 +657,7 @@ def main() -> None:
     log_info("Starting scraper...")
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=HEADLESS)
+            browser = playwright.chromium.launch(channel=BROWSER_CHANNEL, headless=HEADLESS)
             context = browser.new_context(locale=BROWSER_LOCALE)
             try:
                 page = context.new_page()

@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project outputs
+output/
+*_estrela.xlsx
+.idea/

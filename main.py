@@ -10,9 +10,9 @@ from urllib.parse import quote_plus
 import pandas as pd
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-ESTABLISHMENT_NAME = "Disney's Hollywood Studios"
-TARGET_STARS = 4
-MAX_REVIEWS = 5
+ESTABLISHMENT_NAME = "Magic Kingdom"
+TARGET_STARS = 2
+MAX_REVIEWS = 50
 OUTPUT_FOLDER = "./output"
 HEADLESS = False
 WAIT_TIMEOUT = 30000
@@ -32,6 +32,20 @@ SEARCH_LOAD_WAIT_MS = 10000
 POLL_INTERVAL_MS = 300
 MAX_REVIEW_BUTTON_CANDIDATES = 5
 REVIEWS_READY_WAIT_MULTIPLIER = 4
+REVIEW_SCAN_WINDOW = 150
+END_OF_LIST_MARKERS = (
+    "You've reached the end of the list.",
+    "You reached the end of the list.",
+    "Você chegou ao final da lista.",
+)
+UNWANTED_URL_KEYWORDS = ("accounts.google.com", "/maps/contrib/")
+UNSAFE_REVIEW_ACTION_KEYWORDS = (
+    "fazer login",
+    "write a review",
+    "escrever uma avaliação",
+    "escrever uma avaliacao",
+    "avaliar",
+)
 
 TODAY_KEYWORDS = ("hoje", "today", "just now", "agora")
 YESTERDAY_KEYWORDS = ("ontem", "yesterday")
@@ -130,14 +144,11 @@ REVIEWS_CONTAINER_SELECTORS = (
 REVIEW_CARD_SELECTOR = "div.jftiEf"
 
 REVIEWS_BUTTON_SELECTORS = (
+    "[jsaction*='reviewChart.moreReviews']",
+    "button[jsaction*='tabs.tabClick'][aria-label*='Avaliações de']",
+    "button[jsaction*='tabs.tabClick'][aria-label*='Avaliacoes de']",
+    "button[jsaction*='tabs.tabClick'][aria-label*='Reviews for']",
     "button[jsaction*='pane.rating.moreReviews']",
-    "button[jsaction*='reviewChart.moreReviews']",
-    "button[aria-label*='Reviews for']",
-    "button[aria-label*='Avalia']",
-    "button:has-text('reviews')",
-    "button:has-text('Reviews')",
-    "button:has-text('avaliações')",
-    "button:has-text('Avali')",
 )
 
 SORT_BUTTON_SELECTORS = (
@@ -152,7 +163,11 @@ REVIEWER_NAME_SELECTORS = (".d4r55", ".TSUbDb")
 REVIEW_TEXT_SELECTORS = (".wiI7pd", ".MyEned")
 REVIEW_DATE_SELECTORS = (".rsqaWe", "span:has-text('ago')", "span:has-text('há')")
 RATING_LABEL_SELECTORS = ("span.kvMYJc", "span[aria-label*='star']", "span[aria-label*='estrela']")
-EXPAND_REVIEW_BUTTON_SELECTORS = ("button.w8nwRe", "button:has-text('More')", "button:has-text('Mais')")
+EXPAND_REVIEW_BUTTON_SELECTORS = (
+    "button[jsaction*='review.expandReview']",
+    "button.w8nwRe[aria-label*='Ver mais']",
+    "button.w8nwRe[aria-label*='More']",
+)
 
 
 def log_info(message: str) -> None:
@@ -489,8 +504,24 @@ def open_reviews(page: Page) -> None:
                 try:
                     if not button.is_visible():
                         continue
+                    if is_unsafe_reviews_action(button):
+                        continue
+                    if not is_likely_reviews_open_button(button):
+                        continue
+
+                    previous_url = page.url
                     button.click(timeout=WAIT_TIMEOUT)
                     page.wait_for_timeout(POST_ACTION_WAIT_MS)
+                    close_unwanted_popup_pages(page)
+
+                    if is_unwanted_reviews_navigation(page.url):
+                        log_warning("Unexpected navigation while opening reviews. Returning to place page.")
+                        page.go_back(wait_until="domcontentloaded", timeout=WAIT_TIMEOUT)
+                        page.wait_for_timeout(POST_ACTION_WAIT_MS)
+                        if page.url == previous_url:
+                            continue
+                        continue
+
                     wait_for_reviews_ready(page, POST_ACTION_WAIT_MS * REVIEWS_READY_WAIT_MULTIPLIER)
                     return
                 except Exception:  # noqa: BLE001
@@ -545,6 +576,73 @@ def filter_by_stars(page: Page) -> None:
         log_warning(f"UI star filter unavailable. Using extraction filter only. Details: {exc}")
 
 
+def has_reached_end_of_reviews(page: Page) -> bool:
+    for marker in END_OF_LIST_MARKERS:
+        try:
+            if page.get_by_text(marker, exact=False).first.is_visible():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def is_unwanted_reviews_navigation(url: str) -> bool:
+    lowered_url = (url or "").lower()
+    return any(keyword in lowered_url for keyword in UNWANTED_URL_KEYWORDS)
+
+
+def is_unsafe_reviews_action(button: Locator) -> bool:
+    try:
+        button_text = normalize_text(button.inner_text()).lower()
+    except Exception:  # noqa: BLE001
+        button_text = ""
+    try:
+        button_aria = normalize_text(button.get_attribute("aria-label")).lower()
+    except Exception:  # noqa: BLE001
+        button_aria = ""
+
+    content = f"{button_text} {button_aria}"
+    return any(keyword in content for keyword in UNSAFE_REVIEW_ACTION_KEYWORDS)
+
+
+def is_likely_reviews_open_button(button: Locator) -> bool:
+    try:
+        jsaction = normalize_text(button.get_attribute("jsaction")).lower()
+    except Exception:  # noqa: BLE001
+        jsaction = ""
+
+    if not jsaction:
+        return False
+
+    if "reviewchart.morereviews" in jsaction or "pane.rating.morereviews" in jsaction:
+        return True
+
+    if "tabs.tabclick" in jsaction:
+        try:
+            button_text = normalize_text(button.inner_text()).lower()
+        except Exception:  # noqa: BLE001
+            button_text = ""
+        try:
+            button_aria = normalize_text(button.get_attribute("aria-label")).lower()
+        except Exception:  # noqa: BLE001
+            button_aria = ""
+        content = f"{button_text} {button_aria}"
+        return "avalia" in content or "review" in content
+
+    return False
+
+
+def close_unwanted_popup_pages(page: Page) -> None:
+    for opened_page in page.context.pages:
+        if opened_page == page:
+            continue
+        try:
+            if is_unwanted_reviews_navigation(opened_page.url):
+                opened_page.close()
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def extract_review(review_card: Locator) -> Optional[dict]:
     for selector in EXPAND_REVIEW_BUTTON_SELECTORS:
         try:
@@ -563,8 +661,6 @@ def extract_review(review_card: Locator) -> Optional[dict]:
     stars = parse_stars_from_label(rating_label)
 
     review_text = get_text_from_selectors(review_card, REVIEW_TEXT_SELECTORS)
-    if not normalize_text(review_text):
-        return None
 
     raw_review_date = get_text_from_selectors(review_card, REVIEW_DATE_SELECTORS)
     review_date = normalize_review_date(raw_review_date)
@@ -577,57 +673,112 @@ def extract_review(review_card: Locator) -> Optional[dict]:
     }
 
 
+def build_review_key(review_data: dict) -> str:
+    return "|".join(
+        [
+            normalize_text(review_data.get("nome_da_pessoa", "")),
+            normalize_text(review_data.get("data_avaliacao", "")),
+            str(review_data.get("estrelas", "")),
+            normalize_text(review_data.get("avaliacao", "")),
+        ]
+    )
+
+
 def scroll_until_n_reviews(page: Page) -> list[dict]:
     log_info("Collecting reviews...")
     reviews_feed = wait_for_reviews_container(page)
 
     collected_reviews: list[dict] = []
-    seen_reviews: set[str] = set()
+    seen_all_reviews: set[str] = set()
+    seen_target_reviews: set[str] = set()
+    seen_target_reviews_with_comment: set[str] = set()
+    seen_collected_reviews: set[str] = set()
     idle_scrolls = 0
-    scanned_count = 0
+    total_reviews_analyzed = 0
+    total_target_star_reviews_analyzed = 0
+    total_target_star_reviews_with_comment = 0
+    stop_reason = "unknown"
 
     while len(collected_reviews) < MAX_REVIEWS and idle_scrolls < MAX_IDLE_SCROLLS:
+        if has_reached_end_of_reviews(page):
+            stop_reason = "all_reviews_analyzed"
+            break
+
         review_cards = page.locator(REVIEW_CARD_SELECTOR)
         review_count = review_cards.count()
         previous_count = len(collected_reviews)
-        previous_review_count = review_count
+        previous_scroll_height = reviews_feed.evaluate("(element) => element.scrollHeight")
+        previous_scroll_top = reviews_feed.evaluate("(element) => element.scrollTop")
 
-        for index in range(scanned_count, review_count):
+        start_index = max(0, review_count - REVIEW_SCAN_WINDOW)
+
+        for index in range(start_index, review_count):
             review_card = review_cards.nth(index)
             review_data = extract_review(review_card)
             if not review_data:
                 continue
 
-            if review_data["estrelas"] != TARGET_STARS:
+            review_key = build_review_key(review_data)
+            has_comment = bool(normalize_text(review_data["avaliacao"]))
+
+            if review_key not in seen_all_reviews:
+                seen_all_reviews.add(review_key)
+                total_reviews_analyzed += 1
+
+            if review_data["estrelas"] == TARGET_STARS and review_key not in seen_target_reviews:
+                seen_target_reviews.add(review_key)
+                total_target_star_reviews_analyzed += 1
+
+            if review_data["estrelas"] == TARGET_STARS and has_comment and review_key not in seen_target_reviews_with_comment:
+                seen_target_reviews_with_comment.add(review_key)
+                total_target_star_reviews_with_comment += 1
+
+            if review_data["estrelas"] != TARGET_STARS or not has_comment:
                 continue
 
-            review_key = "|".join(
-                [
-                    review_data["nome_da_pessoa"],
-                    review_data["data_avaliacao"],
-                    review_data["avaliacao"],
-                ]
-            )
-            if review_key in seen_reviews:
+            if review_key in seen_collected_reviews:
                 continue
 
             collected_reviews.append(review_data)
-            seen_reviews.add(review_key)
+            seen_collected_reviews.add(review_key)
             log_info(f"Collected {len(collected_reviews)}/{MAX_REVIEWS} reviews")
 
             if len(collected_reviews) >= MAX_REVIEWS:
+                stop_reason = "max_reviews_reached"
                 break
-
-        scanned_count = review_count
 
         reviews_feed.evaluate("(element) => { element.scrollTop = element.scrollHeight; }")
         page.wait_for_timeout(SCROLL_WAIT_MS)
         new_review_count = page.locator(REVIEW_CARD_SELECTOR).count()
+        new_scroll_height = reviews_feed.evaluate("(element) => element.scrollHeight")
+        new_scroll_top = reviews_feed.evaluate("(element) => element.scrollTop")
 
-        if len(collected_reviews) == previous_count and new_review_count <= previous_review_count:
+        if has_reached_end_of_reviews(page):
+            stop_reason = "all_reviews_analyzed"
+            break
+
+        loaded_new_content = (
+            new_review_count > review_count
+            or new_scroll_height > previous_scroll_height
+            or new_scroll_top > previous_scroll_top
+        )
+
+        if len(collected_reviews) == previous_count and not loaded_new_content:
             idle_scrolls += 1
         else:
             idle_scrolls = 0
+
+    if stop_reason == "unknown" and idle_scrolls >= MAX_IDLE_SCROLLS:
+        stop_reason = "all_reviews_analyzed"
+
+    log_info(f"Total de todas avaliações analisadas: {total_reviews_analyzed}")
+    log_info(f"Total de avaliações de {TARGET_STARS} estrelas analisadas: {total_target_star_reviews_analyzed}")
+    log_info(
+        f"{total_target_star_reviews_with_comment} de {total_target_star_reviews_analyzed} "
+        f"avaliações de {TARGET_STARS} estrelas com comentarios disponiveis"
+    )
+    if stop_reason == "all_reviews_analyzed":
+        log_info("Coleta interrompida porque todas as avaliações disponiveis ja foram analisadas")
 
     return collected_reviews[:MAX_REVIEWS]
 

@@ -10,9 +10,9 @@ from urllib.parse import quote_plus
 import pandas as pd
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-ESTABLISHMENT_NAME = "Magic Kingdom"
-TARGET_STARS = 2
-MAX_REVIEWS = 50
+ESTABLISHMENT_NAME = "Tokyo Disneyland"
+TARGET_STARS = 3
+MAX_REVIEWS = 150
 OUTPUT_FOLDER = "./output"
 HEADLESS = False
 WAIT_TIMEOUT = 30000
@@ -137,11 +137,12 @@ SEARCH_BOX_SELECTORS = (
 )
 FIRST_RESULT_SELECTOR = "a.hfpxzc"
 REVIEWS_CONTAINER_SELECTORS = (
-    "div[role='feed']",
     "div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde",
     "div.m6QErb.DxyBCb.kA9KIf.dS8AEf",
+    "div[role='feed']",
 )
 REVIEW_CARD_SELECTOR = "div.jftiEf"
+REVIEWS_URL_MARKER = "!1b1"
 
 REVIEWS_BUTTON_SELECTORS = (
     "[jsaction*='reviewChart.moreReviews']",
@@ -365,19 +366,68 @@ def wait_for_first_visible_locator(page: Page, selectors: tuple[str, ...], timeo
 
 
 def wait_for_reviews_container(page: Page) -> Locator:
-    return wait_for_first_visible_locator(page, REVIEWS_CONTAINER_SELECTORS, WAIT_TIMEOUT)
+    deadline = time.time() + (WAIT_TIMEOUT / 1000)
+    while time.time() < deadline:
+        for selector in REVIEWS_CONTAINER_SELECTORS:
+            containers = page.locator(selector)
+            for index in range(containers.count()):
+                container = containers.nth(index)
+                if is_likely_reviews_container(container):
+                    return container
+        page.wait_for_timeout(POLL_INTERVAL_MS)
+    raise PlaywrightTimeoutError("Could not find the reviews list container.")
 
 
 def is_reviews_section_ready(page: Page) -> bool:
+    return is_reviews_panel_open(page)
+
+
+def is_reviews_panel_open(page: Page) -> bool:
     try:
-        has_card = page.locator(REVIEW_CARD_SELECTOR).count() > 0
-        if not has_card:
-            return False
-        has_container = first_visible_locator(page, REVIEWS_CONTAINER_SELECTORS) is not None
+        if REVIEWS_URL_MARKER in page.url:
+            return True
         has_sort_button = first_visible_locator(page, SORT_BUTTON_SELECTORS) is not None
-        return has_container or has_sort_button
+        reviews_container = find_reviews_container_if_available(page)
+        return has_sort_button and reviews_container is not None
     except Exception:  # noqa: BLE001
         return False
+
+
+def find_reviews_container_if_available(page: Page) -> Optional[Locator]:
+    for selector in REVIEWS_CONTAINER_SELECTORS:
+        containers = page.locator(selector)
+        for index in range(containers.count()):
+            container = containers.nth(index)
+            if is_likely_reviews_container(container):
+                return container
+    return None
+
+
+def is_likely_reviews_container(container: Locator) -> bool:
+    try:
+        if not container.is_visible():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+    try:
+        text = strip_accents(normalize_text(container.inner_text()).lower())
+    except Exception:  # noqa: BLE001
+        return False
+
+    is_search_results_feed = "resultados" in text or "search results" in text
+    if is_search_results_feed:
+        return False
+
+    try:
+        if container.locator(REVIEW_CARD_SELECTOR).count() > 0:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    has_reviews_controls = "ordenar" in text or "sort" in text
+    has_reviews_label = "avaliac" in text or "review" in text
+    return has_reviews_controls and has_reviews_label
 
 
 def wait_for_reviews_ready(page: Page, timeout_ms: int) -> None:
@@ -387,6 +437,28 @@ def wait_for_reviews_ready(page: Page, timeout_ms: int) -> None:
             return
         page.wait_for_timeout(POLL_INTERVAL_MS)
     raise PlaywrightTimeoutError("Reviews section did not become ready.")
+
+
+def wait_for_review_cards(reviews_feed: Locator, timeout_ms: int) -> None:
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        if reviews_feed.locator(REVIEW_CARD_SELECTOR).count() > 0:
+            return
+        try:
+            reviews_feed.evaluate(
+                """
+                (element) => {
+                    const scrollStep = Math.max(400, element.clientHeight || 0);
+                    element.scrollTop = Math.min(element.scrollHeight, element.scrollTop + scrollStep);
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        reviews_feed.page.wait_for_timeout(POLL_INTERVAL_MS)
+    raise PlaywrightTimeoutError(
+        "Reviews panel opened, but Google Maps did not load review cards."
+    )
 
 
 def is_search_successful(page: Page) -> bool:
@@ -495,37 +567,25 @@ def open_reviews(page: Page) -> None:
         if is_reviews_section_ready(page):
             return
 
-        for selector in REVIEWS_BUTTON_SELECTORS:
-            buttons = page.locator(selector)
-            button_count = min(buttons.count(), MAX_REVIEW_BUTTON_CANDIDATES)
+        for button in get_reviews_open_button_candidates(page):
+            try:
+                previous_url = page.url
+                button.click(timeout=WAIT_TIMEOUT)
+                page.wait_for_timeout(POST_ACTION_WAIT_MS)
+                close_unwanted_popup_pages(page)
 
-            for index in range(button_count):
-                button = buttons.nth(index)
-                try:
-                    if not button.is_visible():
-                        continue
-                    if is_unsafe_reviews_action(button):
-                        continue
-                    if not is_likely_reviews_open_button(button):
-                        continue
-
-                    previous_url = page.url
-                    button.click(timeout=WAIT_TIMEOUT)
+                if is_unwanted_reviews_navigation(page.url):
+                    log_warning("Unexpected navigation while opening reviews. Returning to place page.")
+                    page.go_back(wait_until="domcontentloaded", timeout=WAIT_TIMEOUT)
                     page.wait_for_timeout(POST_ACTION_WAIT_MS)
-                    close_unwanted_popup_pages(page)
-
-                    if is_unwanted_reviews_navigation(page.url):
-                        log_warning("Unexpected navigation while opening reviews. Returning to place page.")
-                        page.go_back(wait_until="domcontentloaded", timeout=WAIT_TIMEOUT)
-                        page.wait_for_timeout(POST_ACTION_WAIT_MS)
-                        if page.url == previous_url:
-                            continue
+                    if page.url == previous_url:
                         continue
-
-                    wait_for_reviews_ready(page, POST_ACTION_WAIT_MS * REVIEWS_READY_WAIT_MULTIPLIER)
-                    return
-                except Exception:  # noqa: BLE001
                     continue
+
+                wait_for_reviews_ready(page, WAIT_TIMEOUT)
+                return
+            except Exception:  # noqa: BLE001
+                continue
 
         wait_for_reviews_ready(page, WAIT_TIMEOUT)
 
@@ -536,6 +596,7 @@ def sort_by_latest(page: Page) -> None:
     log_info("Sorting reviews by latest...")
 
     def action() -> None:
+        wait_for_reviews_ready(page, WAIT_TIMEOUT)
         sort_button = first_visible_locator(page, SORT_BUTTON_SELECTORS)
         if not sort_button:
             raise PlaywrightTimeoutError("Could not find sort button.")
@@ -547,6 +608,8 @@ def sort_by_latest(page: Page) -> None:
             if option.is_visible():
                 option.click(timeout=WAIT_TIMEOUT)
                 page.wait_for_timeout(POST_ACTION_WAIT_MS)
+                reviews_feed = wait_for_reviews_container(page)
+                wait_for_review_cards(reviews_feed, WAIT_TIMEOUT)
                 return
         raise PlaywrightTimeoutError("Could not find newest option.")
 
@@ -554,32 +617,15 @@ def sort_by_latest(page: Page) -> None:
 
 
 def filter_by_stars(page: Page) -> None:
-    log_info(f"Filtering {TARGET_STARS}-star reviews...")
-
-    def action() -> None:
-        star_selectors = (
-            f"button[aria-label*='{TARGET_STARS} star']",
-            f"button[aria-label*='{TARGET_STARS} stars']",
-            f"button[aria-label*='{TARGET_STARS} estrela']",
-            f"button[aria-label*='{TARGET_STARS} estrelas']",
-        )
-        star_button = first_visible_locator(page, star_selectors)
-        if star_button:
-            star_button.click(timeout=WAIT_TIMEOUT)
-            page.wait_for_timeout(POST_ACTION_WAIT_MS)
-            return
-        raise PlaywrightTimeoutError("Could not find star filter button.")
-
-    try:
-        run_with_retry("Filter by stars", action)
-    except Exception as exc:  # noqa: BLE001
-        log_warning(f"UI star filter unavailable. Using extraction filter only. Details: {exc}")
+    log_info(
+        f"Keeping reviews sorted by latest and filtering {TARGET_STARS}-star reviews during extraction..."
+    )
 
 
-def has_reached_end_of_reviews(page: Page) -> bool:
+def has_reached_end_of_reviews(reviews_feed: Locator) -> bool:
     for marker in END_OF_LIST_MARKERS:
         try:
-            if page.get_by_text(marker, exact=False).first.is_visible():
+            if reviews_feed.get_by_text(marker, exact=False).first.is_visible():
                 return True
         except Exception:  # noqa: BLE001
             continue
@@ -589,6 +635,58 @@ def has_reached_end_of_reviews(page: Page) -> bool:
 def is_unwanted_reviews_navigation(url: str) -> bool:
     lowered_url = (url or "").lower()
     return any(keyword in lowered_url for keyword in UNWANTED_URL_KEYWORDS)
+
+
+def get_reviews_open_button_candidates(page: Page) -> list[Locator]:
+    candidates: list[tuple[int, Locator]] = []
+    for selector in REVIEWS_BUTTON_SELECTORS:
+        buttons = page.locator(selector)
+        button_count = min(buttons.count(), MAX_REVIEW_BUTTON_CANDIDATES)
+
+        for index in range(button_count):
+            button = buttons.nth(index)
+            try:
+                if not button.is_visible():
+                    continue
+                if is_unsafe_reviews_action(button):
+                    continue
+                if not is_likely_reviews_open_button(button):
+                    continue
+                candidates.append((score_reviews_open_button(button), button))
+            except Exception:  # noqa: BLE001
+                continue
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [button for _, button in candidates]
+
+
+def score_reviews_open_button(button: Locator) -> int:
+    try:
+        jsaction = normalize_text(button.get_attribute("jsaction")).lower()
+    except Exception:  # noqa: BLE001
+        jsaction = ""
+    try:
+        button_text = normalize_text(button.inner_text()).lower()
+    except Exception:  # noqa: BLE001
+        button_text = ""
+    try:
+        button_aria = normalize_text(button.get_attribute("aria-label")).lower()
+    except Exception:  # noqa: BLE001
+        button_aria = ""
+
+    content = strip_accents(f"{button_text} {button_aria}")
+    establishment = strip_accents(ESTABLISHMENT_NAME.lower())
+
+    score = 0
+    if "tabs.tabclick" in jsaction:
+        score += 100
+    if establishment and establishment in content:
+        score += 50
+    if "avalia" in content or "review" in content:
+        score += 20
+    if "reviewchart.morereviews" in jsaction or "pane.rating.morereviews" in jsaction:
+        score += 10
+    return score
 
 
 def is_unsafe_reviews_action(button: Locator) -> bool:
@@ -643,12 +741,20 @@ def close_unwanted_popup_pages(page: Page) -> None:
             continue
 
 
-def extract_review(review_card: Locator) -> Optional[dict]:
+def extract_review(review_card: Locator, reviews_feed: Optional[Locator] = None) -> Optional[dict]:
     for selector in EXPAND_REVIEW_BUTTON_SELECTORS:
         try:
             expand_button = review_card.locator(selector).first
             if expand_button.is_visible():
-                expand_button.click(timeout=WAIT_TIMEOUT)
+                current_scroll_top = None
+                if reviews_feed:
+                    current_scroll_top = reviews_feed.evaluate("(element) => element.scrollTop")
+                expand_button.evaluate("(element) => element.click()")
+                if reviews_feed and current_scroll_top is not None:
+                    reviews_feed.evaluate(
+                        "(element, scrollTop) => { element.scrollTop = scrollTop; }",
+                        current_scroll_top,
+                    )
                 break
         except Exception:  # noqa: BLE001
             continue
@@ -684,9 +790,20 @@ def build_review_key(review_data: dict) -> str:
     )
 
 
+def build_saved_review_key(review_data: dict) -> str:
+    return "|".join(
+        [
+            normalize_text(review_data.get("nome_da_pessoa", "")),
+            normalize_text(review_data.get("data_avaliacao", "")),
+            str(review_data.get("estrelas", "")),
+        ]
+    )
+
+
 def scroll_until_n_reviews(page: Page) -> list[dict]:
     log_info("Collecting reviews...")
     reviews_feed = wait_for_reviews_container(page)
+    wait_for_review_cards(reviews_feed, WAIT_TIMEOUT)
 
     collected_reviews: list[dict] = []
     seen_all_reviews: set[str] = set()
@@ -700,11 +817,11 @@ def scroll_until_n_reviews(page: Page) -> list[dict]:
     stop_reason = "unknown"
 
     while len(collected_reviews) < MAX_REVIEWS and idle_scrolls < MAX_IDLE_SCROLLS:
-        if has_reached_end_of_reviews(page):
+        if has_reached_end_of_reviews(reviews_feed):
             stop_reason = "all_reviews_analyzed"
             break
 
-        review_cards = page.locator(REVIEW_CARD_SELECTOR)
+        review_cards = reviews_feed.locator(REVIEW_CARD_SELECTOR)
         review_count = review_cards.count()
         previous_count = len(collected_reviews)
         previous_scroll_height = reviews_feed.evaluate("(element) => element.scrollHeight")
@@ -714,11 +831,12 @@ def scroll_until_n_reviews(page: Page) -> list[dict]:
 
         for index in range(start_index, review_count):
             review_card = review_cards.nth(index)
-            review_data = extract_review(review_card)
+            review_data = extract_review(review_card, reviews_feed)
             if not review_data:
                 continue
 
             review_key = build_review_key(review_data)
+            saved_review_key = build_saved_review_key(review_data)
             has_comment = bool(normalize_text(review_data["avaliacao"]))
 
             if review_key not in seen_all_reviews:
@@ -736,11 +854,11 @@ def scroll_until_n_reviews(page: Page) -> list[dict]:
             if review_data["estrelas"] != TARGET_STARS or not has_comment:
                 continue
 
-            if review_key in seen_collected_reviews:
+            if saved_review_key in seen_collected_reviews:
                 continue
 
             collected_reviews.append(review_data)
-            seen_collected_reviews.add(review_key)
+            seen_collected_reviews.add(saved_review_key)
             log_info(f"Collected {len(collected_reviews)}/{MAX_REVIEWS} reviews")
 
             if len(collected_reviews) >= MAX_REVIEWS:
@@ -749,11 +867,11 @@ def scroll_until_n_reviews(page: Page) -> list[dict]:
 
         reviews_feed.evaluate("(element) => { element.scrollTop = element.scrollHeight; }")
         page.wait_for_timeout(SCROLL_WAIT_MS)
-        new_review_count = page.locator(REVIEW_CARD_SELECTOR).count()
+        new_review_count = reviews_feed.locator(REVIEW_CARD_SELECTOR).count()
         new_scroll_height = reviews_feed.evaluate("(element) => element.scrollHeight")
         new_scroll_top = reviews_feed.evaluate("(element) => element.scrollTop")
 
-        if has_reached_end_of_reviews(page):
+        if has_reached_end_of_reviews(reviews_feed):
             stop_reason = "all_reviews_analyzed"
             break
 
@@ -798,6 +916,11 @@ def save_excel(reviews: list[dict]) -> Path:
         "data_avaliacao",
     ]
     dataframe = pd.DataFrame(reviews, columns=columns)
+    initial_count = len(dataframe)
+    dataframe = dataframe.drop_duplicates(subset=["nome_da_pessoa", "data_avaliacao", "estrelas"], keep="first")
+    removed_count = initial_count - len(dataframe)
+    if removed_count:
+        log_info(f"Removed {removed_count} duplicate reviews before generating Excel")
     dataframe.to_excel(file_path, index=False, engine="openpyxl")
 
     log_info("Excel generated successfully")
